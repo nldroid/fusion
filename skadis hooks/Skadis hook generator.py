@@ -1,200 +1,168 @@
 import adsk.core, adsk.fusion, traceback
+from typing import Optional, Tuple, List
 
-# Constanten
-WIDTH_MM = 4.8
-HEIGHT_MM = 7.5
-BOARD_DEPTH_MM = 5.0
-HOOK_LENGTH_MM = 6.0
-FILLET_RADIUS_MM = 1.5
-PATTERN_DISTANCE_MM = 40.0
-DIST_FROM_BOTTOM_MM = 30
+# -----------------------------
+# Constants (mm)
+# -----------------------------
+WIDTH_MM            = 4.8
+HEIGHT_MM           = 7.5
+BOARD_DEPTH_MM      = 5.0
+HOOK_LENGTH_MM      = 6.0
+FILLET_RADIUS_MM    = 1.5
+PATTERN_DISTANCE_MM = 40.0   # Skådis grid
+DIST_FROM_BOTTOM_MM = 30.0
 
-def run(context):
-    ui = None
-    try:
-        app = adsk.core.Application.get()
-        ui  = app.userInterface
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        rootComp = design.rootComponent
+# -----------------------------
+# Unit helper (Fusion API werkt in cm)
+# -----------------------------
+def mm(value: float) -> float:
+    """mm -> cm (Fusion interne units)."""
+    return value / 10.0
 
-        filter_str = 'LinearEdges' # ,SketchLines
+# -----------------------------
+# UI helpers
+# -----------------------------
+def fail(ui: adsk.core.UserInterface, msg: str) -> None:
+    ui.messageBox(msg)
+    raise RuntimeError(msg)
 
-        sel_h_axis = ui.selectEntity('Selecteer onderste horizontale edge van de face ', filter_str)
-        if not sel_h_axis: return
-        h_axis = sel_h_axis.entity
-        if not hasattr(h_axis,'geometry'):
-            ui.messageBox('Deze as is geen edge van een object')
-            return
-        
-        sel_v_axis = ui.selectEntity('Selecteer linker verticale edge van de face ', filter_str)
-        if not sel_v_axis: return
-        v_axis = sel_v_axis.entity
-        if not hasattr(v_axis,'geometry'):
-            ui.messageBox('Deze as is geen edge van een object')
-            return
-        
-        # 2. Zoek het gemeenschappelijke vlak
-        face = None
-        for face_h in h_axis.faces:
-            for face_v in v_axis.faces:
-                if face_h.tempId == face_v.tempId:
-                    face = face_h
-                    break
-            if face:
-                break
+def select_linear_edge(ui: adsk.core.UserInterface, prompt: str) -> adsk.fusion.BRepEdge:
+    sel = ui.selectEntity(prompt, 'LinearEdges')
+    if not sel:
+        raise RuntimeError('Selectie geannuleerd')
+    edge = adsk.fusion.BRepEdge.cast(sel.entity)
+    if not getattr(edge, 'geometry', None):
+        fail(ui, 'Selecteer een lineaire edge.')
+    return edge
 
-        # 3. Foutcontrole
-        if not face:
-            ui.messageBox('Fout: De twee geselecteerde edges liggen niet op hetzelfde vlak.')
-            return        
-        
-        # 1. Haal de hoekpunten op van beide edges
-        h_points = [h_axis.startVertex, h_axis.endVertex]
-        v_points = [v_axis.startVertex, v_axis.endVertex]
+# -----------------------------
+# Geometry helpers (2D sketch space)
+# -----------------------------
+def find_common_face(h_edge: adsk.fusion.BRepEdge, v_edge: adsk.fusion.BRepEdge) -> Optional[adsk.fusion.BRepFace]:
+    for fh in h_edge.faces:
+        for fv in v_edge.faces:
+            if fh.tempId == fv.tempId:
+                return fh
+    return None
 
-        common_vertex = None
+def find_common_vertex(h_edge: adsk.fusion.BRepEdge, v_edge: adsk.fusion.BRepEdge) -> Optional[adsk.fusion.BRepVertex]:
+    for vh in (h_edge.startVertex, h_edge.endVertex):
+        for vv in (v_edge.startVertex, v_edge.endVertex):
+            if vh.tempId == vv.tempId:
+                return vh
+    return None
 
-        # 2. Zoek naar een match tussen de twee lijsten
-        for v_h in h_points:
-            for v_v in v_points:
-                # We vergelijken de vertices op basis van hun interne tempId
-                if v_h.tempId == v_v.tempId:
-                    common_vertex = v_h
-                    break
+def unit_vec_2d(a: adsk.core.Point2D, b: adsk.core.Point2D) -> adsk.core.Vector2D:
+    v = a.vectorTo(b)
+    v.normalize()
+    return v
 
-        # 3. Resultaat afhandelen
-        if not common_vertex:
-            ui.messageBox('Fout: De geselecteerde edges raken elkaar niet.')
-            return
+def rel_point_2d(base: adsk.core.Point2D, du: float, dv: float,
+                 u: adsk.core.Vector2D, v: adsk.core.Vector2D) -> adsk.core.Point2D:
+    """base + du*u + dv*v (alles in cm)"""
+    p = adsk.core.Point2D.create(base.x, base.y)
+    mu = adsk.core.Vector2D.create(u.x, u.y); mu.scaleBy(du); p.translateBy(mu)
+    mv = adsk.core.Vector2D.create(v.x, v.y); mv.scaleBy(dv); p.translateBy(mv)
+    return p
 
-        # 1. Bepaal de hoekpunten die NIET het gedeelde punt zijn
-        # De overkant van de horizontale as (Rechtsonder)
-        p_right_bottom = h_axis.startVertex.geometry if h_axis.endVertex.tempId == common_vertex.tempId else h_axis.endVertex.geometry
+def add_rectangle_by_lb_rt(sk: adsk.fusion.Sketch,
+                           p_lb: adsk.core.Point2D,
+                           p_rt: adsk.core.Point2D) -> adsk.fusion.SketchLine:
+    """Teken rechthoek via LB/RT in sketch space (1 API-call)."""
+    return sk.sketchCurves.sketchLines.addTwoPointRectangle(
+        adsk.core.Point3D.create(p_lb.x, p_lb.y, 0),
+        adsk.core.Point3D.create(p_rt.x, p_rt.y, 0)
+    )
 
-        # De overkant van de verticale as (Linksboven)
-        p_left_top = v_axis.startVertex.geometry if v_axis.endVertex.tempId == common_vertex.tempId else v_axis.endVertex.geometry
+def smallest_profile(sk: adsk.fusion.Sketch) -> adsk.fusion.Profile:
+    """Kies kleinste gesloten regio (robuustste keuze voor jouw scenario)."""
+    return min(sk.profiles, key=lambda p: p.areaProperties().area)
 
-        # 2. Bereken de vector van Linksonder naar Linksboven
-        # Dit vertelt ons hoe ver en in welke richting we 'omhoog' moeten
-        vec_up = common_vertex.geometry.vectorTo(p_left_top)
+# -----------------------------
+# Features helpers
+# -----------------------------
+def extrude(root: adsk.fusion.Component,
+            profile: adsk.fusion.Profile,
+            distance_cm: float,
+            op: adsk.fusion.FeatureOperations = adsk.fusion.FeatureOperations.NewBodyFeatureOperation
+           ) -> adsk.fusion.ExtrudeFeature:
+    ex = root.features.extrudeFeatures
+    inp = ex.createInput(profile, op)
+    inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(distance_cm))
+    return ex.add(inp)
 
-        # 3. Pas deze vector toe op het punt Rechtsonder
-        # We maken een nieuw punt aan op de locatie van Rechtsonder
-        p_right_top = adsk.core.Point3D.create(p_right_bottom.x, p_right_bottom.y, p_right_bottom.z)
+def add_edge_fillet(root: adsk.fusion.Component,
+                    body: adsk.fusion.BRepBody,
+                    exclude_faces: List[adsk.fusion.BRepFace],
+                    radius_cm: float) -> None:
+    """Fillet op alle body-randen die NIET grenzen aan exclude_faces."""
+    exclude = {f.tempId for f in exclude_faces}
+    edges = [e for e in body.edges if all(f.tempId not in exclude for f in e.faces)]
+    if not edges:
+        return
+    col = adsk.core.ObjectCollection.create()
+    for e in edges:
+        col.add(e)
+    ff = root.features.filletFeatures
+    fi = ff.createInput()
+    fi.addConstantRadiusEdgeSet(col, adsk.core.ValueInput.createByReal(radius_cm), True)
+    ff.add(fi)
 
-        # Verplaats dit nieuwe punt met de 'omhoog' vector
-        p_right_top.translateBy(vec_up)
+def pattern_linear(root: adsk.fusion.Component,
+                   entities: List[adsk.core.Base],
+                   axis: adsk.fusion.BRepEdge,
+                   qty: int,
+                   spacing_cm: float) -> adsk.fusion.RectangularPatternFeature:
+    """Lineair patroon langs 'axis' met qty en spacing (alleen richting 1)."""
+    col = adsk.core.ObjectCollection.create()
+    for e in entities:
+        col.add(e)
+    pf = root.features.rectangularPatternFeatures
+    inp = pf.createInput(
+        col,
+        axis,
+        adsk.core.ValueInput.createByString(str(max(1, qty))),
+        adsk.core.ValueInput.createByReal(-spacing_cm),
+        adsk.fusion.PatternDistanceType.SpacingPatternDistanceType
+    )
+    inp.quantityTwo = adsk.core.ValueInput.createByReal(1)
+    inp.isSymmetricInDirectionOne = False
+    return pf.add(inp)
 
-        # 1. Maak de sketch op de face
-        sketches = design.rootComponent.sketches
-        sketch1 = sketches.add(face)
+# -----------------------------
+# Grid & positionering (strakke 40 mm logica)
+# -----------------------------
+def compute_row_on_grid(face_len_u_cm: float,
+                        hook_width_cm: float,
+                        grid_cm: float) -> Tuple[int, float]:
+    """
+    Bepaal exact:
+      - qty = max aantal haken op hart-op-hart 'grid_cm'
+      - margin_u = centrering zodat totale lengte w + (q-1)*grid_cm gecentreerd ligt
+    Formules:
+      q   = floor((L - w)/G) + 1  (minstens 1)
+      mar = (L - (w + (q-1)*G)) / 2
+    """
+    if face_len_u_cm <= 0:
+        return 1, 0.0
+    G = grid_cm
+    L = face_len_u_cm
+    w = hook_width_cm
+    if L < w:
+        # Er past maar 1 haak; zet 'm midden
+        return 1, (L - w) / 2.0
+    q = int((L - w) // G) + 1
+    q = max(1, q)
+    total = w + (q - 1) * G
+    margin_u = (L - total) / 2.0
+    return q, margin_u
 
-        # 2. Pak de 3D punten van jouw gekozen edges
-        # We gebruiken de common_vertex (linksonder) die we eerder vonden
-        p_lb_3d = common_vertex.geometry
-
-        # Vind het uiteinde van de horizontale as (rechtsonder)
-        p_rb_3d = h_axis.startVertex.geometry if h_axis.endVertex.tempId == common_vertex.tempId else h_axis.endVertex.geometry
-
-        # Vind het uiteinde van de verticale as (linksboven)
-        p_lt_3d = v_axis.startVertex.geometry if v_axis.endVertex.tempId == common_vertex.tempId else v_axis.endVertex.geometry
-
-        # 3. Vertaal deze SPECIFIEKE punten naar de 2D sketch ruimte
-        p_lb_2d = sketch1.modelToSketchSpace(p_lb_3d)
-        p_rb_2d = sketch1.modelToSketchSpace(p_rb_3d)
-        p_lt_2d = sketch1.modelToSketchSpace(p_lt_3d)
-
-        # 4. Bereken nu het punt 'rechtsboven' in 2D
-        # We gebruiken 2D vectoren in de sketch om het vierde punt te vinden
-        vec_h_2d = adsk.core.Vector2D.create(p_rb_2d.x - p_lb_2d.x, p_rb_2d.y - p_lb_2d.y)
-        vec_v_2d = adsk.core.Vector2D.create(p_lt_2d.x - p_lb_2d.x, p_lt_2d.y - p_lb_2d.y)
-
-        # Het punt rechtsboven is: Linksonder + Horizontale vector + Verticale vector
-        p_rt_2d = adsk.core.Point2D.create(p_lb_2d.x, p_lb_2d.y)
-        p_rt_2d.translateBy(vec_h_2d)
-        p_rt_2d.translateBy(vec_v_2d)
-
-        # 1. Definieer de basis-vectoren van jouw gekozen assen
-        u_vec = p_lb_2d.vectorTo(p_rb_2d)
-        u_vec.normalize()
-
-        v_vec = p_lb_2d.vectorTo(p_lt_2d)
-        v_vec.normalize()
-
-        # 2. Afmetingen (Width/Height van de hook-basis)
-        w_cm = WIDTH_MM / 10.0
-        h_cm = HEIGHT_MM / 10.0
-        
-        # Totale lengte van de face om te centreren
-        face_length_u = p_lb_2d.distanceTo(p_rb_2d)
-        
-        # 1. Lengte van de verticale as
-        v_length = face_length_u
-        
-        # 2. Instellingen
-        margin_v = 0 # 0.6     
-        hook_spacing = PATTERN_DISTANCE_MM / 10 + w_cm / 2 # 40 mm (Skadis grid)
-
-        # 3. Berekening
-        # Beschikbare lengte voor het grid
-        netto_lengte = v_length - margin_v
-        
-        if netto_lengte < 0:
-            quantity = 1
-        else:
-            # We tellen de eerste haak (op 0) + het aantal keer dat de spacing past
-            quantity = int(netto_lengte // hook_spacing) + 1  
-
-        # 3. Bereken de startpositie voor de EERSTE haak
-        # (Als je er later 3 wilt, moet de eerste op de juiste plek starten voor het pattern)
-        total_hooks_width = ((quantity - 1) * 4.0) + w_cm
-        margin_u = (face_length_u - total_hooks_width) / 2.0
-        margin_v = DIST_FROM_BOTTOM_MM / 10 # mm vanaf de onderkant
-
-        # Helper om punten te berekenen langs jouw assen
-        def get_rel_point(base_pt, dist_u, dist_v, u_dir, v_dir):
-            # We maken nieuwe vectoren op basis van de richtingen en schalen ze
-            move_u = adsk.core.Vector2D.create(u_dir.x, u_dir.y)
-            move_u.scaleBy(dist_u)
-            move_v = adsk.core.Vector2D.create(v_dir.x, v_dir.y)
-            move_v.scaleBy(dist_v)
-            
-            new_pt = adsk.core.Point2D.create(base_pt.x, base_pt.y)
-            new_pt.translateBy(move_u)
-            new_pt.translateBy(move_v)
-            return new_pt
-
-        # 4. Bereken de hoekpunten van de master-rechthoek
-        # Linksonder van de eerste haak
-        p1 = get_rel_point(p_lb_2d, margin_u, margin_v, u_vec, v_vec)
-        # Rechtsboven van de eerste haak
-        p2 = get_rel_point(p_lb_2d, margin_u + w_cm, margin_v + h_cm, u_vec, v_vec)
-
-        # 5. Teken de rechthoek
-        # We gebruiken 4 lijnen in plaats van addTwoPointRectangle omdat we 
-        # dan zeker weten dat hij de rotatie van onze vectoren volgt
-        p1_3d = adsk.core.Point3D.create(p1.x, p1.y, 0)
-        
-        # Bereken de andere twee hoeken voor een perfecte rotatie
-        corner2 = get_rel_point(p_lb_2d, margin_u + w_cm, margin_v, u_vec, v_vec)
-        corner4 = get_rel_point(p_lb_2d, margin_u, margin_v + h_cm, u_vec, v_vec)
-        
-        lines = sketch1.sketchCurves.sketchLines
-        lines.addByTwoPoints(p1_3d, adsk.core.Point3D.create(corner2.x, corner2.y, 0))
-        lines.addByTwoPoints(adsk.core.Point3D.create(corner2.x, corner2.y, 0), adsk.core.Point3D.create(p2.x, p2.y, 0))
-        lines.addByTwoPoints(adsk.core.Point3D.create(p2.x, p2.y, 0), adsk.core.Point3D.create(corner4.x, corner4.y, 0))
-        lines.addByTwoPoints(adsk.core.Point3D.create(corner4.x, corner4.y, 0), p1_3d)
-
-        # 4. Extrusie 1
-        prof1 = sorted(sketch1.profiles, key=lambda p: p.areaProperties().area)[0]
-        extrudes = rootComp.features.extrudeFeatures
-        dist1 = adsk.core.ValueInput.createByReal((BOARD_DEPTH_MM + WIDTH_MM) / 10.0)
-        ext_input1 = extrudes.createInput(prof1, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-        ext_input1.setDistanceExtent(False, dist1)
-        ext_feat1 = extrudes.add(ext_input1)
-        hook_body = ext_feat1.bodies.item(0)
-        hook_body.name = "Haak"
-
+# -----------------------------
+# Target-face voor 90° haak & hulpfuncties
+# -----------------------------
+def closest_face_along_edge_dir(body: adsk.fusion.BRepBody,
+                                v_axis: adsk.fusion.BRepEdge,
+                                h_axis: adsk.fusion.BRepEdge) -> Optional[adsk.fusion.BRepFace]:
         # 1. Richting bepalen (Verticale vector)
         v_geom = v_axis.geometry
         v_dir = v_geom.startPoint.vectorTo(v_geom.endPoint)
@@ -206,7 +174,7 @@ def run(context):
         target_face = None
         min_dist = float('inf')
 
-        for face in hook_body.faces:
+        for face in body.faces:
             # Pak het middelpunt van het vlak
             test_pt = face.pointOnFace
             
@@ -221,75 +189,123 @@ def run(context):
             if dist < min_dist:
                 min_dist = dist
                 target_face = face
+        return target_face
 
+
+
+def farthest_vertex_on_face(face: adsk.fusion.BRepFace) -> adsk.core.Point3D:
+    o = face.geometry.origin
+    best_pt, best_d = None, -1.0
+    for e in face.edges:
+        for v in (e.startVertex, e.endVertex):
+            d = v.geometry.distanceTo(o)
+            if d > best_d:
+                best_pt, best_d = v.geometry, d
+    return best_pt
+
+# -----------------------------
+# Main
+# -----------------------------
+def run(context):
+    ui = None
+    try:
+        app = adsk.core.Application.get()
+        ui = app.userInterface
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        root = design.rootComponent
+        sketches = root.sketches
+
+        # 1) Selecteer referentie-assen op de face
+        h_axis = select_linear_edge(ui, 'Selecteer onderste horizontale edge van de face')
+        v_axis = select_linear_edge(ui, 'Selecteer linker verticale edge van de face')
+
+        # 2) Validaties: gemeenschappelijke face + hoekpunt
+        face = find_common_face(h_axis, v_axis)
+        if not face:
+            fail(ui, 'Fout: De twee geselecteerde edges liggen niet op hetzelfde vlak.')
+
+        common_vertex = find_common_vertex(h_axis, v_axis)
+        if not common_vertex:
+            fail(ui, 'Fout: De geselecteerde edges raken elkaar niet.')
+
+        # 3) Sketch op face + 3D->2D referentiepunten
+        sk1 = sketches.add(face)
+        p_lb_3d = common_vertex.geometry
+        p_rb_3d = h_axis.startVertex.geometry if h_axis.endVertex.tempId == common_vertex.tempId else h_axis.endVertex.geometry
+        p_lt_3d = v_axis.startVertex.geometry if v_axis.endVertex.tempId == common_vertex.tempId else v_axis.endVertex.geometry
+
+        p_lb = sk1.modelToSketchSpace(p_lb_3d)
+        p_rb = sk1.modelToSketchSpace(p_rb_3d)
+        p_lt = sk1.modelToSketchSpace(p_lt_3d)
+
+        # 4) u/v-richtingen en afmetingen (cm)
+        u_vec = unit_vec_2d(p_lb, p_rb)
+        v_vec = unit_vec_2d(p_lb, p_lt)
+        face_len_u = p_lb.distanceTo(p_rb)
+
+        w_cm = mm(WIDTH_MM)
+        h_cm = mm(HEIGHT_MM)
+        grid_cm = mm(PATTERN_DISTANCE_MM)
+        bottom_offset_cm = mm(DIST_FROM_BOTTOM_MM)
+
+        # 5) Strakke grid-bepaling langs u-as
+        qty, margin_u = compute_row_on_grid(face_len_u_cm=face_len_u,
+                                            hook_width_cm=w_cm,
+                                            grid_cm=grid_cm)
+        margin_v = bottom_offset_cm
+
+        # 6) Rechthoek van eerste haak
+        p1 = rel_point_2d(p_lb, margin_u,            margin_v,            u_vec, v_vec)       # LB
+        p2 = rel_point_2d(p_lb, margin_u + w_cm,     margin_v + h_cm,     u_vec, v_vec)       # RT
+        add_rectangle_by_lb_rt(sk1, p1, p2)
+
+        # 7) Extrusie: nieuw body
+        prof1 = smallest_profile(sk1)
+        ext1  = extrude(root, prof1, mm(BOARD_DEPTH_MM + WIDTH_MM))
+        hook_body = ext1.bodies.item(0)
+        hook_body.name = 'Haak'
+
+        # 8) 90° haak: kies target-face en maak kleine rechthoek (vierkant)
+        target_face = closest_face_along_edge_dir(hook_body, v_axis, h_axis)
         if target_face:
-            sketch2 = sketches.add(target_face)
-            sketch2.name = "90 graden haak"
-            
-            # Verste punt zoeken
-            start_3d = face.geometry.origin
-            best_pt_3d = None
-            max_d = -1.0
-            for edge in target_face.edges:
-                for v in [edge.startVertex, edge.endVertex]:
-                    d = v.geometry.distanceTo(start_3d)
-                    if d > max_d:
-                        max_d = d
-                        best_pt_3d = v.geometry
-            
-            target_2d = sketch2.modelToSketchSpace(best_pt_3d)
-            
-            # Bepaal het midden van de schets voor de verschuivingsrichting
-            # We berekenen het midden van de bounding box van het vlak opnieuw
+            sk2 = sketches.add(target_face)
+            sk2.name = '90 graden haak'
+
+            best_3d = farthest_vertex_on_face(target_face)
+            target_2d = sk2.modelToSketchSpace(best_3d)
+
+            # center afleiden via face-bounding box
             bb = target_face.boundingBox
-            mid_3d = adsk.core.Point3D.create((bb.minPoint.x + bb.maxPoint.x)/2, (bb.minPoint.y + bb.maxPoint.y)/2, (bb.minPoint.z + bb.maxPoint.z)/2)
-            mid_2d = sketch2.modelToSketchSpace(mid_3d)
-            
-            half_w = (WIDTH_MM / 10.0) / 2.0
+            mid_3d = adsk.core.Point3D.create(
+                (bb.minPoint.x + bb.maxPoint.x)/2,
+                (bb.minPoint.y + bb.maxPoint.y)/2,
+                (bb.minPoint.z + bb.maxPoint.z)/2
+            )
+            mid_2d = sk2.modelToSketchSpace(mid_3d)
+
+            half_w = w_cm / 2.0
             s_x = -half_w if target_2d.x > mid_2d.x else half_w
             s_y = -half_w if target_2d.y > mid_2d.y else half_w
-            
-            final_center = adsk.core.Point3D.create(target_2d.x + s_x, target_2d.y + s_y, 0)
-            p1 = adsk.core.Point3D.create(final_center.x - half_w, final_center.y - half_w, 0)
-            p2 = adsk.core.Point3D.create(final_center.x + half_w, final_center.y + half_w, 0)
-            sketch2.sketchCurves.sketchLines.addTwoPointRectangle(p1, p2)
-            
-            prof2 = sorted(sketch2.profiles, key=lambda p: p.areaProperties().area)[0]
-            dist2 = adsk.core.ValueInput.createByReal(HOOK_LENGTH_MM / 10.0)
-            ext_input2 = extrudes.createInput(prof2, adsk.fusion.FeatureOperations.JoinFeatureOperation)
-            ext_input2.setDistanceExtent(False, dist2)
-            extrudes.add(ext_input2)
+            center = adsk.core.Point3D.create(target_2d.x + s_x, target_2d.y + s_y, 0)
 
-        # 6. Fillets & Pattern
-        edge_col = adsk.core.ObjectCollection.create()
-        start_ids = [sf.tempId for sf in ext_feat1.startFaces]
-        for edge in hook_body.edges:
-            if not any(f.tempId in start_ids for f in edge.faces):
-                edge_col.add(edge)
-        
-        if edge_col.count > 0:
-            f_in = rootComp.features.filletFeatures.createInput()
-            f_in.addConstantRadiusEdgeSet(edge_col, adsk.core.ValueInput.createByReal(FILLET_RADIUS_MM / 10.0), True)
-            rootComp.features.filletFeatures.add(f_in)
+            p1sq = adsk.core.Point3D.create(center.x - half_w, center.y - half_w, 0)
+            p2sq = adsk.core.Point3D.create(center.x + half_w, center.y + half_w, 0)
+            sk2.sketchCurves.sketchLines.addTwoPointRectangle(p1sq, p2sq)
 
-        # 6. Rectangular Pattern (Alleen langs Axis 1)
-        ents = adsk.core.ObjectCollection.create()
-        ents.add(hook_body)
-        
-        # Maak de input voor het patroon
-        pattern_features = rootComp.features.rectangularPatternFeatures
-        pattern_input = pattern_features.createInput(ents, h_axis, adsk.core.ValueInput.createByString(str(quantity)), adsk.core.ValueInput.createByReal(-PATTERN_DISTANCE_MM / 10.0), adsk.fusion.PatternDistanceType.SpacingPatternDistanceType)
-        
-        # FORCEER: Zet de tweede richting op 1 (dus geen patroon de andere kant op)
-        #pattern_input.directionTwoQuantity = adsk.core.ValueInput.createByReal(1)
+            prof2 = smallest_profile(sk2)
+            extrude(root, prof2, mm(HOOK_LENGTH_MM),
+                    adsk.fusion.FeatureOperations.JoinFeatureOperation)
+            sk2.isVisible = False
 
-        pattern_input.quantityTwo = adsk.core.ValueInput.createByReal(1)
-        pattern_input.isSymmetricInDirectionOne = False
-        
-        # Voer de pattern uit
-        pattern_features.add(pattern_input)
-        sketch1.isVisible = False
-        if 'sketch2' in locals(): sketch2.isVisible = False
+        # 9) Fillets (alle randen behalve startFaces van eerste extrusie)
+        add_edge_fillet(root, hook_body, [f for f in ext1.startFaces], mm(FILLET_RADIUS_MM))
 
-    except:
-        if ui: ui.messageBox(traceback.format_exc())
+        # 10) Lineair pattern langs h-as met exact grid_cm spacing
+        pattern_linear(root, [hook_body], h_axis, qty, grid_cm)
+
+        # Opruimen
+        sk1.isVisible = False
+
+    except Exception:
+        if ui:
+            ui.messageBox(traceback.format_exc())

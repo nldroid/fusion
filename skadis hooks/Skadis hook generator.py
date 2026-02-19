@@ -29,10 +29,10 @@ def fail(ui: adsk.core.UserInterface, msg: str) -> None:
 def select_linear_edge(ui: adsk.core.UserInterface, prompt: str) -> adsk.fusion.BRepEdge:
     sel = ui.selectEntity(prompt, 'LinearEdges')
     if not sel:
-        raise RuntimeError('Selectie geannuleerd')
+        raise RuntimeError('Selection cancelled')
     edge = adsk.fusion.BRepEdge.cast(sel.entity)
     if not getattr(edge, 'geometry', None):
-        fail(ui, 'Selecteer een lineaire edge.')
+        fail(ui, 'Selecteer a linear face edge.')
     return edge
 
 # -----------------------------
@@ -216,17 +216,17 @@ def run(context):
         sketches = root.sketches
 
         # 1) Selecteer referentie-assen op de face
-        h_axis = select_linear_edge(ui, 'Selecteer onderste horizontale edge van de face')
-        v_axis = select_linear_edge(ui, 'Selecteer linker verticale edge van de face')
+        h_axis = select_linear_edge(ui, 'Select lower horizontal face edge')
+        v_axis = select_linear_edge(ui, 'Select left vertical face edge')
 
         # 2) Validaties: gemeenschappelijke face + hoekpunt
         face = find_common_face(h_axis, v_axis)
         if not face:
-            fail(ui, 'Fout: De twee geselecteerde edges liggen niet op hetzelfde vlak.')
+            fail(ui, 'Error: The two selected edges aren\'t on the same face.')
 
         common_vertex = find_common_vertex(h_axis, v_axis)
         if not common_vertex:
-            fail(ui, 'Fout: De geselecteerde edges raken elkaar niet.')
+            fail(ui, 'Error: The selected faces do not cross at one point.')
 
         # 3) Sketch op face + 3D->2D referentiepunten
         sk1 = sketches.add(face)

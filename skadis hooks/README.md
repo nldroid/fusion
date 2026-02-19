@@ -41,3 +41,10 @@ FILLET_RADIUS_MM    = 1.5
 PATTERN_DISTANCE_MM = 40.0   # Skådis grid
 DIST_FROM_BOTTOM_MM = 30.0
 ```
+
+## Privacy policy
+The SKÅDIS hook generator operates with a "Privacy by Design" local-only model:
+- No Data Collection: This script does not collect, log, or store any personal information.
+- No Data Transmission: No data is ever sent to a server, third party, or external API.
+- Local Processing: All operations are performed strictly on your local machine.
+In short: Your data never leaves your computer.

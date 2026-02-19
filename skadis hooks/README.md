@@ -1,6 +1,4 @@
-# SKÅDIS hook generator for Fusion360
-
-# SKÅDIS Hook Generator for Autodesk Fusion
+# SKÅDIS Hook Generator for Autodesk Fusion 360
 
 A Python-based automation script for **Autodesk Fusion** that instantly generates IKEA SKÅDIS-compatible mounting hooks onto any planar surface.
 
